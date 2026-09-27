@@ -1,0 +1,16 @@
+compare xllm -> hf
+status=mismatch mismatches=3
+[config_mismatches]
+ok
+[layer_mismatches]
+{"layer": 1, "left": {"kind": "mova"}, "right": {"kind": "moe"}}
+[missing_in_right]
+"model.layers.1.self_attn.v_router.bias"
+[unexpected_in_right]
+ok
+[shape_mismatches]
+ok
+[stats_mismatches]
+ok
+[numeric_deltas]
+{"max_abs_diff": 0.25, "mean_abs_diff": 0.125, "name": "foo"}
