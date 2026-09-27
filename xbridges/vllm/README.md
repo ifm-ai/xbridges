@@ -13,14 +13,14 @@ bash xbridges/vllm/add_xllm_to_vllm.sh
 
 ## Launch Vllm Server
 ```shell
-sbatch xbridges/vllm/launch_vllm_server.sh
+MODEL=/abs/path/to/hf_ckpts/my-model sbatch xbridges/vllm/launch_vllm_server.sh
 ```
-* Update `--model` in `launch_vllm_server.sh` with the HuggingFace model folder.
+* `MODEL` must be an absolute path to the HuggingFace model folder; requests use it as the model name.
 
 ## Call Vllm Server and Prompt the Model
 ```shell
-MODEL="/mnt/weka/shrd/k2m/suqi.sun/bbq_image/k2mova-36b-mid4_v2/checkpoint_0010000"
-SERVER="http://fs-mbz-gpu-089:6380"
+MODEL="/abs/path/to/hf_ckpts/my-model"
+SERVER="http://<vllm_head>"  # printed as vllm_head in slurm.out
 
 QUERY="{
   \"model\": \"${MODEL}\",
@@ -39,8 +39,8 @@ curl ${SERVER}/v1/completions -H "Content-Type: application/json" -d "${QUERY}" 
 
 ## Evaluation
 ```shell
-MODEL="/mnt/weka/shrd/k2m/suqi.sun/bbq_image/k2mova-36b-mid4_v2/checkpoint_0010000"
-SERVER="http://fs-mbz-gpu-089:6380"
+MODEL="/abs/path/to/hf_ckpts/my-model"
+SERVER="http://<vllm_head>"  # printed as vllm_head in slurm.out
 
 MODEL_ARGS="\
 model=${MODEL},\

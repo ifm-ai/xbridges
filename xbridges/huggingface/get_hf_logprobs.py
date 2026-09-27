@@ -1,7 +1,10 @@
+import os
+import json
 import fire
 import torch
 import torch.distributed as dist
 from torch.distributed.pipelining import PipelineStage, ScheduleGPipe
+from safetensors.torch import load_file
 from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
 
 
@@ -34,15 +37,21 @@ class PPWrapper(torch.nn.Module):
 
     def load_weights(self, ckpt_dir, device):
         print(f'Loading {device} params -- layers [{self.layer_l}, {self.layer_r})')
-        state_dict = {}
-        ckpt_idxes = list(range(self.layer_l + 1, self.layer_r + 1))
-        if self.layer_l == 0 and self.num_layers not in ckpt_idxes:
-            ckpt_idxes.append(self.num_layers)
+        stage_keys = self.model.state_dict().keys()
+        if os.path.exists(f'{ckpt_dir}/model.safetensors.index.json'):
+            index_name = 'model.safetensors.index.json'
+        else:
+            index_name = 'pytorch_model.bin.index.json'
+        weight_map = json.load(open(f'{ckpt_dir}/{index_name}'))['weight_map']
 
-        for ckpt_idx in ckpt_idxes:
-            sd = torch.load(f'{ckpt_dir}/pytorch_model-{ckpt_idx:05d}-of-{self.num_layers:05d}.bin')
+        state_dict = {}
+        for filename in sorted({weight_map[key] for key in stage_keys}):
+            if filename.endswith('.safetensors'):
+                sd = load_file(f'{ckpt_dir}/{filename}')
+            else:
+                sd = torch.load(f'{ckpt_dir}/{filename}', weights_only=True)
             for key, value in sd.items():
-                if key in self.model.state_dict():
+                if key in stage_keys:
                     state_dict[key] = value
 
         self.model.load_state_dict(state_dict, assign=True)
