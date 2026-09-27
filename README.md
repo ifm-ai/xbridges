@@ -41,10 +41,7 @@ environment.
 
 ### 1. Install xLLM
 
-xBridges reads and writes xLLM checkpoints and uses the xLLM runtime to compute
-reference logprobs, so install xLLM first. PyTorch must already be installed:
-`setup.py` imports it to build the native extensions (hence
-`--no-build-isolation`).
+xBridges uses xLLM to read checkpoints and compute reference logprobs:
 
 ```bash
 git clone https://github.com/ifm-ai/xllm.git
@@ -61,8 +58,7 @@ for other attention backends (FlashAttention 3/4, xattn).
 
 ### 2. Install xBridges
 
-xBridges runs from source. Run all commands from the repository root with it on
-`PYTHONPATH`:
+Clone xBridges and add it to `PYTHONPATH`. The commands below run from the repository root.
 
 ```bash
 git clone https://github.com/ifm-ai/xbridges.git
@@ -100,8 +96,8 @@ python -m xbridges.huggingface.xllm_to_hf_main \
   --save_dir "$HF_CKPT"
 ```
 
-The output directory must be new or empty. Output is BF16 safetensors by
-default. For large models, convert layers in parallel (FP32 `.bin` output):
+This writes BF16 safetensors to a new directory. For large models, convert
+layers in parallel:
 
 ```bash
 python -m xbridges.huggingface.xllm_to_hf_parallel \
@@ -111,30 +107,15 @@ python -m xbridges.huggingface.xllm_to_hf_parallel \
 
 ### 2. Validate the Conversion
 
-For models that fit on one GPU, `validate.py` loads the xLLM checkpoint and its
-Hugging Face conversion side by side and prints logprobs from both. No
-conversion is needed beforehand; by default it uses `cuda:0` for xLLM and
-`cuda:1` for Hugging Face (`--xllm_device`, `--hf_device`).
+Run the xLLM and Hugging Face models on the same document and compare their
+logprobs (xLLM on `cuda:0`, Hugging Face on `cuda:1`):
 
 ```bash
 python -m xbridges.huggingface.validate \
   --xllm_dir "$XLLM_CKPT" --tokenizer_dir "$TOKENIZER"
 ```
 
-Alternatively, print logprobs from each model separately and compare them.
-xLLM logprobs are computed in FP32, so convert with `--dtype float32` for an
-exact comparison:
-
-```bash
-torchrun --standalone --nproc_per_node=1 xbridges/huggingface/get_xllm_logprobs.py \
-  --xllm_dir "$XLLM_CKPT" --tokenizer_dir "$TOKENIZER" --model_parallel_size 1
-
-torchrun --standalone --nproc_per_node=1 xbridges/huggingface/get_hf_logprobs.py \
-  --ckpt_dir "$HF_CKPT"
-```
-
-`--model_parallel_size` must equal the checkpoint's TP size, and
-`--nproc_per_node` must equal `--model_parallel_size`. For multi-node models, see
+For models that need multiple GPUs or nodes, see
 [Multi-GPU/Node Models](xbridges/huggingface/README.md#multi-gpunode-models).
 
 ### 3. Run with Transformers
@@ -153,9 +134,6 @@ output = model.generate(**inputs, max_new_tokens=32)
 print(tokenizer.decode(output[0], skip_special_tokens=True))
 ```
 
-A 100-step model produces little more than noise; this step checks that the
-checkpoint loads and runs.
-
 ### 4. Convert Back to xLLM (optional)
 
 ```bash
@@ -164,23 +142,19 @@ python -m xbridges.huggingface.hf_to_xllm_main \
   --save_dir xllm_ckpts/quickstart
 ```
 
-TP size is inferred from checkpoints written by xBridges; pass `--tp_size`
-otherwise. Run with `--help` for rank batching, Slurm-array, and resume options.
-To start an xLLM training run from the result, pass
-`--base_model_dir xllm_ckpts/quickstart` to xLLM's `train.py`.
+Start xLLM training from the result with
+`--base_model_dir xllm_ckpts/quickstart`.
 
 ### 5. Serve with vLLM (optional)
 
-In the vLLM environment, register K2 Horizon with vLLM, then submit
-[`launch_vllm_server.sh`](xbridges/vllm/launch_vllm_server.sh) with `MODEL` set
-to the absolute path of the converted checkpoint:
+In the vLLM environment:
 
 ```bash
 bash xbridges/vllm/add_xllm_to_vllm.sh
 MODEL=$(realpath "$HF_CKPT") sbatch xbridges/vllm/launch_vllm_server.sh
 ```
 
-Once the server is up (its address is printed as `vllm_head` in `slurm.out`):
+Then query the server (`vllm_head` is printed in `slurm.out`):
 
 ```bash
 curl http://<vllm_head>/v1/completions \
@@ -195,12 +169,6 @@ curl http://<vllm_head>/v1/completions \
 | **Convert and validate checkpoints** | [Hugging Face bridge](xbridges/huggingface/README.md): conversion options and multi-node logprob validation. |
 | **Serve and evaluate with vLLM** | [vLLM bridge](xbridges/vllm/README.md): environment, server launch, querying, and `lm-eval`. |
 | **Train a model** | [xLLM](https://github.com/ifm-ai/xllm): training, data, and evaluation. |
-
-> [!IMPORTANT]
-> Converted Hugging Face checkpoints can be used for inference, evaluation, and
-> fine-tuning. Training behavior in the bundled Hugging Face implementation may
-> differ from native xLLM (e.g., the auxiliary load-balancing loss); to continue
-> pretraining, use the native xLLM checkpoint and runtime.
 
 ## Repository Layout
 
