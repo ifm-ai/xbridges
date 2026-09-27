@@ -294,7 +294,10 @@ def test_native_expert_dcp_export(tmp_path, monkeypatch, kind, tp_size, layout):
     raw = Tokenizer(WordLevel({f't{i}': i for i in range(32)}, unk_token='t2'))
     tokenizer = PreTrainedTokenizerFast(tokenizer_object=raw, bos_token='t0', eos_token='t1', pad_token='t31')
     tokenizer.save_pretrained(tokdir)
-    bridge.main(str(root), str(tokdir), str(output), layers_per_load=1)
+    bridge.main(
+        str(root), str(tokdir), str(output), layers_per_load=1,
+        dtype='float32', safe_serialization=False,
+    )
     exported = {}
     for file in sorted(output.glob('*.bin')):
         exported.update(torch.load(file, weights_only=True))
