@@ -2,14 +2,14 @@ import fire
 import json
 import torch
 from xllm.config import ModelConf, TokenizerConf, SlurmConf
-from xllm.data.tokenizer.huggingface import HuggingFaceTokenizer
+from xllm.data.dataset_streamer.tokenizer.huggingface import HuggingFaceTokenizer
 from xllm.models.transformer import Transformer
 from xllm.distributed.slurm import init_torch_distributed
 from xllm.distributed import initialize_model_parallel
 from transformers import AutoTokenizer
 from accelerate import init_empty_weights
 
-from xbridges.huggingface.xllm.modeling_xllm import XllmForCausalLM
+from xbridges.huggingface.k2_horizon.modeling_k2_horizon import K2HorizonForCausalLM
 from xbridges.huggingface.xllm_to_hf_main import (
     get_total_params,
     load_xllm_state_dict,
@@ -76,7 +76,7 @@ def main(xllm_dir='ckpts/xllm-30b-a3b',
     hf_tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir)
     hf_config = convert_config_xllm_to_hf(xllm_config, hf_tokenizer)
     with init_empty_weights():
-        hf_model = XllmForCausalLM(config=hf_config)
+        hf_model = K2HorizonForCausalLM(config=hf_config)
     print(f'{hf_config=}')
     print(f'{hf_model=}')
     print(f'{get_total_params(hf_model)=:,}')

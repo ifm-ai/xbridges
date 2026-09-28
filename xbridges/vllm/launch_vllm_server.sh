@@ -9,6 +9,9 @@
 #SBATCH --output=slurm.out
 #SBATCH --error=slurm.err
 
+# Hugging Face checkpoint to serve, e.g. `MODEL=/abs/path/to/hf_ckpt sbatch launch_vllm_server.sh`
+: "${MODEL:?Set MODEL to the Hugging Face checkpoint directory}"
+
 ### Cluster Network Setting - M1
 #export OMPI_MCA_coll_hcoll_enable=0 \
 #CUDA_DEVICE_ORDER=PCI_BUS_ID \
@@ -117,7 +120,7 @@ done
 srun --overlap --nodes=1 --ntasks=1 -w ${head_name} --export=ALL \
   vllm serve \
     --distributed-executor-backend ray \
-    --model /mnt/weka/shrd/k2m/suqi.sun/bbq_image/k2mova-36b-mid4_v2/checkpoint_0010000 \
+    --model "${MODEL}" \
     --model-impl vllm \
     --tensor-parallel-size $((SLURM_JOB_NUM_NODES * SLURM_GPUS_PER_NODE)) \
     --dtype float32 \

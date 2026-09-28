@@ -11,7 +11,7 @@ from torch.distributed.checkpoint import FileSystemReader
 from torch.distributed.checkpoint.default_planner import _EmptyStateDictLoadPlanner
 from torch.distributed.checkpoint.state_dict_loader import _load_state_dict
 
-from xbridges.huggingface import compare_xllm_checkpoints
+from tests import compare_xllm_checkpoints
 from xbridges.huggingface import hf_to_xllm_main as hf_to_xllm
 from xbridges.huggingface import xllm_to_hf_main as xllm_to_hf
 

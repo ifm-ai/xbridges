@@ -1,7 +1,7 @@
 ## Environment
 ```shell
 conda create --name vllm024 python==3.12
-
+conda activate vllm024
 pip install vllm==0.24.0+cu129 --extra-index-url https://wheels.vllm.ai/0.24.0/cu129 --extra-index-url https://download.pytorch.org/whl/cu129
 pip install --upgrade transformers==5.13.0 fire ray lm-eval[api]==0.4.10
 ```
@@ -13,14 +13,14 @@ bash xbridges/vllm/add_xllm_to_vllm.sh
 
 ## Launch Vllm Server
 ```shell
-sbatch xbridges/vllm/launch_vllm_server.sh
+MODEL=/abs/path/to/hf_ckpts/my-model sbatch xbridges/vllm/launch_vllm_server.sh
 ```
-* Make sure to update line 76, `--model`, with the HuggingFace model folder.
+* `MODEL` must be an absolute path to the HuggingFace model folder; requests use it as the model name.
 
 ## Call Vllm Server and Prompt the Model
 ```shell
-MODEL="/mnt/weka/shrd/k2m/suqi.sun/bbq_image/k2mova-36b-mid4_v2/checkpoint_0010000"
-SERVER="http://fs-mbz-gpu-089:6380"
+MODEL="/abs/path/to/hf_ckpts/my-model"
+SERVER="http://<vllm_head>"  # printed as vllm_head in slurm.out
 
 QUERY="{
   \"model\": \"${MODEL}\",
@@ -39,8 +39,8 @@ curl ${SERVER}/v1/completions -H "Content-Type: application/json" -d "${QUERY}" 
 
 ## Evaluation
 ```shell
-MODEL="/mnt/weka/shrd/k2m/suqi.sun/bbq_image/k2mova-36b-mid4_v2/checkpoint_0010000"
-SERVER="http://fs-mbz-gpu-089:6380"
+MODEL="/abs/path/to/hf_ckpts/my-model"
+SERVER="http://<vllm_head>"  # printed as vllm_head in slurm.out
 
 MODEL_ARGS="\
 model=${MODEL},\

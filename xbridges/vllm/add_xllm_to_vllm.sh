@@ -2,7 +2,15 @@
 set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-vllm_dir=$("${PYTHON:-python}" -c 'import vllm ; assert vllm.__version__ == "0.24.0", vllm.__version__ ; print(vllm.__path__[0])')
+vllm_dir=$("${PYTHON:-python}" -c '
+from packaging.version import Version
+import vllm
+
+version = Version(vllm.__version__)
+if version.base_version != "0.24.0":
+    raise RuntimeError(f"Expected vLLM 0.24.0, found {vllm.__version__}")
+print(vllm.__path__[0])
+')
 echo "vllm_dir=${vllm_dir}"
 
 # Break package-cache hardlinks before replacing installed files.

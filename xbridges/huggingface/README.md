@@ -1,43 +1,70 @@
 ## Environment
 ```
-pip install transformers==5.13.0 fire
+pip install transformers==5.13.0 accelerate fire
 ```
+Run all commands from the repository root with `export PYTHONPATH=$PWD:$PYTHONPATH`.
+Validation scripts also need [xLLM](https://github.com/ifm-ai/xllm#installation) installed.
 
-## Conversion
+## xLLM to HuggingFace
 ```
-PYTHONPATH=./ python xllm_bridges/huggingface/xllm_to_hf_main.py \
-  --xllm_dir /lustrefs/users/bbqbyte/workspace/checkpoints/xllm/k2mova-36B_mid3_v3_110B_jais250k_bsz20M_seq512k_lr4e-5_constant_wd0.06_rope128_dot_te/checkpoints/checkpoint_0005500 \
-  --tokenizer_dir /lustrefs/users/bbqbyte/workspace/checkpoints/huggingface/k2mova-36B_mid3_v3_110B_jais250k_bsz20M_seq512k_lr4e-5_constant_wd0.06_rope128_dot_te/checkpoints/checkpoint_0005500 \
-  --save_dir hf_ckpts/mova-36b
+python -m xbridges.huggingface.xllm_to_hf_main \
+  --xllm_dir /path/to/xllm/checkpoints/checkpoint_00005500 \
+  --tokenizer_dir /path/to/tokenizer \
+  --save_dir hf_ckpts/my-model
 ```
-* `--layers_per_load` is optional and limits loading to the requested layers.
-* For IFM-style BF16 safetensors, add `--dtype bfloat16 --safe_serialization true`.
-  The default remains FP32 `.bin` for numerical validation and existing callers.
+* Output defaults to BF16 safetensors. For FP32 `.bin` shards (e.g., numerical
+  validation), add `--dtype float32 --safe_serialization false`.
+* `--layers_per_load` is optional and limits how many layers are loaded at once.
 * Output uses the bundled IFM `K2HorizonForCausalLM` implementation. Missing or
   unexpected weights and incompatible shapes cause an error. Use a new output
   directory; existing nonempty directories are never overwritten.
 * RoPE is derived from the source checkpoint. Conversion does not implicitly
   apply the additional YaRN context extension used by the published 0.9B model.
-* An example converted checkpoint can be found at `/lustrefs/users/bowen.tan/xllm_bridges_converted/huggingface/mova-36b-ckpt-5500`
+
+### Parallel Conversion
+For large models, `xllm_to_hf_parallel` converts layers in parallel and writes
+FP32 `.bin` shards:
+```
+python -m xbridges.huggingface.xllm_to_hf_parallel \
+  --xllm-dir /path/to/xllm/checkpoints/checkpoint_00005500 \
+  --tokenizer-dir /path/to/tokenizer \
+  --save-dir hf_ckpts/my-model \
+  --workers 8
+```
+* To spread layers across a Slurm allocation, run `--mode prepare` once, one
+  `--mode layer --layer N` per layer, then `--mode finalize`.
+
+## HuggingFace to xLLM
+```
+python -m xbridges.huggingface.hf_to_xllm_main \
+  --hf_dir hf_ckpts/my-model \
+  --save_dir xllm_ckpts/my-model
+```
+* TP size is inferred from checkpoints written by xBridges; otherwise pass `--tp_size`.
+* Run with `--help` for dtype, rank batching, Slurm-array, and resume options.
+* Output is one `full_model.tpNN` directory per TP rank plus `config.json`. Load
+  it in xLLM with `--base_model_dir`; it is not a resumable training checkpoint.
 
 ## Validating Conversion
 
 Print out and compare logprobs for the same document with the xLLM and HuggingFace models separately.
 
 ### Single-GPU Models
-No need conversion, but need `xllm` installed.
+No conversion needed beforehand. Uses `cuda:0` for xLLM and `cuda:1` for
+HuggingFace by default (`--xllm_device`, `--hf_device`).
 ```
-PYTHONPATH=./ python xllm_bridges/huggingface/validate.py \
-	--xllm_dir /lustrefs/users/bbqshort/workspace/checkpoints/xllm/k2v3-4B_mid4_v2_200B_jais250k_bsz20M_seq512k_lr4e-5_constant_wd0.06_rope128/checkpoints/checkpoint_0010000 \
-	--tokenizer_dir /lustrefs/users/bbqshort/workspace/checkpoints/huggingface/k2v3-4B_mid4_v2_200B_jais250k_bsz20M_seq512k_lr4e-5_constant_wd0.06_rope128/checkpoints/checkpoint_0010000
+python -m xbridges.huggingface.validate \
+  --xllm_dir /path/to/xllm/checkpoints/checkpoint_00010000 \
+  --tokenizer_dir /path/to/tokenizer
 ```
-* Make sure the model runs on a single GPU, e.g., `Qwen/Qwen3-30B-A3B` on a H200 is doable. 
+* Make sure the model fits on a single GPU, e.g., `Qwen/Qwen3-30B-A3B` on a H200 is doable.
 
 ### Multi-GPU/Node Models
 
-[Conversion](#conversion) should be completed in advance.
+[Conversion](#xllm-to-huggingface) should be completed in advance, preferably
+with `--dtype float32` to match the FP32 xLLM logprobs.
 
-#### Print xllm logprobs
+#### Print xLLM Logprobs
 ```
 #!/bin/bash
 #SBATCH --job-name=xllm_logprobs
@@ -49,15 +76,16 @@ PYTHONPATH=./ python xllm_bridges/huggingface/validate.py \
 #SBATCH --error=slurm-xllm.err
 
 # Checkpoint paths
-XLLM_DIR="/mnt/weka/shrd/k2m/runner/checkpoints/k2moe375B_txt360v2_256nodes_seed42_bsz32M_seq8k_jais250k_ep8_dot_te_bestfit/checkpoints/checkpoint_0125000"
-TOKENIZER="/mnt/weka/shrd/k2m/xuezhe.ma/data/tokenizers/jais250k_enx10_codex6.5_arax5_3digits"
+XLLM_DIR="/path/to/xllm/checkpoints/checkpoint_00125000"
+TOKENIZER="/path/to/tokenizer"
 
-srun python -u xllm_bridges/huggingface/get_xllm_logprobs.py  \
+srun python -u xbridges/huggingface/get_xllm_logprobs.py \
   --xllm_dir=$XLLM_DIR \
   --tokenizer_dir=$TOKENIZER \
   --model_parallel_size=8
 ```
-* Make sure to update paths of `XLLM_CKPT` & `TOKENIZER`.
+* Make sure to update `XLLM_DIR` & `TOKENIZER`, and set `--model_parallel_size`
+  to the checkpoint's TP size.
 
 #### Print HuggingFace Logprobs
 ```
@@ -76,7 +104,7 @@ srun python -u xllm_bridges/huggingface/get_xllm_logprobs.py  \
 MASTER_ADDR=$(scontrol show hostnames $SLURM_NODELIST | head -n 1)
 MASTER_PORT=29500 # Choose an available port
 
-HF_DIR="/mnt/weka/shrd/k2m/runner/checkpoints/k2moe375B_txt360v2_256nodes_seed42_bsz32M_seq8k_jais250k_ep8_dot_te_bestfit/huggingface/checkpoint_0125000"
+HF_DIR="/path/to/hf_ckpts/my-model"
 
 srun torchrun \
   --nnodes=$SLURM_NNODES \
@@ -84,7 +112,7 @@ srun torchrun \
   --rdzv_id=$SLURM_JOB_ID \
   --rdzv_backend=c10d \
   --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
-  xllm_bridges/huggingface/get_hf_logprobs.py --ckpt_dir $HF_DIR
+  xbridges/huggingface/get_hf_logprobs.py --ckpt_dir $HF_DIR
 ```
 * Make sure to update the `HF_DIR` path.
 
