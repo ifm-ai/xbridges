@@ -41,11 +41,13 @@ from vllm import LLM
 llm = LLM(model=MODEL, trust_remote_code=True,
           speculative_config={"method": "mtp", "num_speculative_tokens": 2})
 ```
-* `num_speculative_tokens` up to D runs MTP modules 1, ..., `num_speculative_tokens`; more reuses them in turn.
+* With vLLM 0.31, `num_speculative_tokens` up to D runs MTP modules 1, ..., `num_speculative_tokens`; more reuses
+  them in turn. vLLM 0.24 runs module 1 for every speculative token.
 * Without speculative decoding, spawned or Ray workers do not import the plugin: serving such an export then needs
   a vLLM K2-Horizon model that skips the MTP layers, as `k2_horizon/modeling_k2_horizon_vllm.py` does.
-* Tested with vLLM 0.31.0 on one GPU: `tests/vllm/check_mtp_draft.py` compares the draft with a reference computed
-  with the Transformers model (`logits`) and checks that greedy outputs do not change (`e2e`).
+* Tested with vLLM 0.24.0 (after `add_xllm_to_vllm.sh`) and 0.31.0, tensor parallel sizes 1 and 2:
+  `tests/vllm/check_mtp_draft.py` compares the draft with a reference computed with the Transformers model
+  (`logits`) and checks that greedy outputs do not change (`e2e`).
 
 ## Call Vllm Server and Prompt the Model
 ```shell
