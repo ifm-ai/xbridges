@@ -105,6 +105,13 @@ python -m xbridges.huggingface.xllm_to_hf_parallel \
   --save-dir "$HF_CKPT" --workers 8
 ```
 
+A checkpoint trained with multi-token prediction (xLLM `model.mtp_depth` = D > 0)
+is converted with `xllm_to_hf_main` only. Its D MTP modules are written to
+`model-mtp.safetensors` as DeepSeek-V3 stores its MTP layers: layers
+`num_hidden_layers`, ..., `num_hidden_layers + D - 1` with `enorm`, `hnorm`,
+`eh_proj` and `shared_head.norm`, and `num_nextn_predict_layers = D` in the
+config (`xbridges/huggingface/mtp.py`). The Transformers model ignores them.
+
 ### 2. Validate the Conversion
 
 Run the xLLM and Hugging Face models on the same document and compare their
