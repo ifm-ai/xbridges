@@ -150,6 +150,15 @@ class K2HorizonMultiTokenPredictor(nn.Module):
             config.hidden_size,
             prefix=maybe_prefix(prefix, "embed_tokens"),
         )
+        # The embeddings computed here, outside the compiled layers, are their input: a
+        # persistent buffer, as CUDA graphs replay from the input addresses of capture.
+        self.register_buffer(
+            "inputs_embeds",
+            torch.zeros(
+                vllm_config.scheduler_config.max_num_batched_tokens, config.hidden_size
+            ),
+            persistent=False,
+        )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -163,7 +172,9 @@ class K2HorizonMultiTokenPredictor(nn.Module):
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
         if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
+            num_tokens = input_ids.shape[0]
+            self.inputs_embeds[:num_tokens].copy_(self.embed_tokens(input_ids))
+            inputs_embeds = self.inputs_embeds[:num_tokens]
         layer = self.layers[
             str(self.mtp_start_layer_idx + spec_step_idx % self.num_mtp_layers)
         ]
