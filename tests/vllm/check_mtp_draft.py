@@ -110,42 +110,62 @@ class Reference:
         return y, self.model.lm_head(y)
 
 
-@torch.no_grad()
-def logits(hf_dir, prompt=PROMPTS[0], dtype='float32', eager=True, atol=3e-3):
-    """Draft vs reference for the first speculative step of `prompt`. Fails above `atol` (max abs diff / max |ref|);
-    in float32 the main model's hidden states differ by about 1e-3 as well (vLLM's kernels use TF32)."""
-    os.environ['VLLM_ENABLE_V1_MULTIPROCESSING'] = '0'  # the engine in this process, to observe the draft
-    import xbridges.vllm.k2_horizon.mtp_plugin  # noqa: F401
-    from vllm import SamplingParams
+def _capture_draft(capture_dir):
+    """Makes the draft save its inputs and outputs (forward) and its logits to capture_dir while capture_dir/on exists,
+    from the processes that run it (vLLM's workers are forked after this)."""
     from xbridges.vllm.k2_horizon import modeling_k2_horizon_mtp_vllm as mtp_vllm
 
-    with open(os.path.join(hf_dir, 'config.json')) as f:
-        depth = json.load(f)['num_nextn_predict_layers']
-    llm = _llm(hf_dir, dtype, eager, depth)
-    calls, draft_logits, capture = [], [], [False]
     forward, compute_logits = mtp_vllm.K2HorizonMultiTokenPredictor.forward, mtp_vllm.K2HorizonMTP.compute_logits
+    count = [0]
+
+    def save(kind, record):
+        if not os.path.exists(os.path.join(capture_dir, 'on')):
+            return
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        if rank == 0:
+            count[0] += 1
+            torch.save({key: value.cpu() if torch.is_tensor(value) else value for key, value in record.items()},
+                       os.path.join(capture_dir, f'{count[0]:04d}_{kind}.pt'))
 
     def capture_forward(self, input_ids, positions, previous_hidden_states, inputs_embeds=None, spec_step_idx=0):
         out = forward(self, input_ids, positions, previous_hidden_states, inputs_embeds, spec_step_idx)
-        if capture[0]:
-            calls.append({'step': spec_step_idx, 'ids': input_ids.clone(), 'positions': positions.clone(),
-                          'hidden': previous_hidden_states.clone(), 'out': out.clone()})
+        save('forward', {'step': spec_step_idx, 'ids': input_ids, 'positions': positions,
+                         'hidden': previous_hidden_states, 'out': out})
         return out
 
     def capture_compute_logits(self, hidden_states, spec_step_idx=0):
         out = compute_logits(self, hidden_states, spec_step_idx)
-        if capture[0]:
-            draft_logits.append(out.clone())
+        if out is not None:
+            save('logits', {'logits': out})
         return out
 
     mtp_vllm.K2HorizonMultiTokenPredictor.forward = capture_forward
     mtp_vllm.K2HorizonMTP.compute_logits = capture_compute_logits
-    capture[0] = True
+
+
+@torch.no_grad()
+def logits(hf_dir, prompt=PROMPTS[0], dtype='float32', eager=True, tp=1, atol=3e-3):
+    """Draft vs reference for the first speculative step of `prompt`. Fails above `atol` (max abs diff / max |ref|);
+    in float32 the main model's hidden states differ by about 1e-3 as well (vLLM's kernels use TF32)."""
+    os.environ['VLLM_ENABLE_V1_MULTIPROCESSING'] = '0'
+    os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'fork'  # the workers keep the capture below
+    from vllm import SamplingParams
+
+    with open(os.path.join(hf_dir, 'config.json')) as f:
+        depth = json.load(f)['num_nextn_predict_layers']
+    capture_dir = tempfile.mkdtemp()
+    _capture_draft(capture_dir)
+    llm = _llm(hf_dir, dtype, eager, depth, tensor_parallel_size=tp)
+    open(os.path.join(capture_dir, 'on'), 'w').close()
     output = llm.generate([prompt], SamplingParams(temperature=0, max_tokens=depth + 1))[0]
-    capture[0] = False
+    os.remove(os.path.join(capture_dir, 'on'))
+    records = [(name, torch.load(os.path.join(capture_dir, name))) for name in sorted(os.listdir(capture_dir))]
+    calls = [r for name, r in records if name.endswith('_forward.pt')]
+    draft_logits = [r['logits'].cuda() for name, r in records if name.endswith('_logits.pt')]
     ids = torch.tensor(output.prompt_token_ids)
     length = len(ids)
-    print(f'prompt {prompt!r}: {length} tokens, vLLM greedy continuation {output.outputs[0].token_ids}', flush=True)
+    print(f'prompt {prompt!r}: {length} tokens, vLLM greedy continuation {output.outputs[0].token_ids} (TP {tp})',
+          flush=True)
     calls, first_logits = calls[:depth], draft_logits[:depth]
     assert [c['step'] for c in calls] == list(range(depth)), [c['step'] for c in calls]
     for c in calls:
@@ -166,6 +186,7 @@ def logits(hf_dir, prompt=PROMPTS[0], dtype='float32', eager=True, atol=3e-3):
             tokens = torch.cat([tokens, torch.tensor([first_logits[k - 2][0].argmax().item()])])
         k_ids = tokens[k:length + k]
         assert c['ids'][:length].tolist() == k_ids.tolist(), (k, c['ids'], k_ids)
+        c = {key: value.cuda() if torch.is_tensor(value) else value for key, value in c.items()}
         if k == 1:
             worst = max(worst, _stats('target final-normed hidden states, vLLM vs Transformers', c['hidden'][:length],
                                       hidden))
@@ -186,7 +207,8 @@ def logits(hf_dir, prompt=PROMPTS[0], dtype='float32', eager=True, atol=3e-3):
     assert worst < atol
 
 
-def generate(hf_dir, out_json, method='mtp', num_speculative_tokens=0, dtype='float32', eager=False, max_tokens=64):
+def generate(hf_dir, out_json, method='mtp', num_speculative_tokens=0, dtype='float32', eager=False, max_tokens=64,
+             tp=1):
     """Greedy generation of PROMPTS, written to out_json with the top-2 logprobs and the speculative decoding
     counters."""
     from vllm import SamplingParams
@@ -196,7 +218,7 @@ def generate(hf_dir, out_json, method='mtp', num_speculative_tokens=0, dtype='fl
         kwargs['speculative_config'] = {'method': method, 'num_speculative_tokens': num_speculative_tokens}
         if method == 'ngram':
             kwargs['speculative_config'].update(prompt_lookup_min=1, prompt_lookup_max=3)
-    llm = _llm(hf_dir, dtype, eager, 0, disable_log_stats=False, **kwargs)
+    llm = _llm(hf_dir, dtype, eager, 0, disable_log_stats=False, tensor_parallel_size=tp, **kwargs)
     outputs = llm.generate(PROMPTS, SamplingParams(temperature=0, max_tokens=max_tokens, ignore_eos=True, logprobs=2))
     result = {
         'prompt_tokens': [list(o.prompt_token_ids) for o in outputs],
@@ -235,7 +257,7 @@ def _offline_acceptance(hf_dir, prompt_tokens, tokens, depth):
 
 
 def e2e(hf_dir, method='mtp', num_speculative_tokens=None, dtype='float32', eager=False, max_tokens=64, spawn=False,
-        tie_tol=5e-3):
+        tie_tol=5e-3, tp=1):
     """Greedy outputs without and with speculative decoding (num_speculative_tokens: the model's MTP depth by
     default; method ngram as a control). spawn: the speculative decoding run with spawned workers. The outputs must
     be the same, up to a position where the two best tokens are within `tie_tol` in logprob: the main model's
@@ -252,7 +274,8 @@ def e2e(hf_dir, method='mtp', num_speculative_tokens=None, dtype='float32', eage
             env = dict(os.environ, VLLM_WORKER_MULTIPROC_METHOD='spawn') if spawn and n else None
             subprocess.run([sys.executable, __file__, 'generate', '--hf_dir', hf_dir, '--out_json', out,
                             '--method', method, '--num_speculative_tokens', str(n), '--dtype', dtype,
-                            '--eager', str(eager), '--max_tokens', str(max_tokens)], check=True, env=env)
+                            '--eager', str(eager), '--max_tokens', str(max_tokens), '--tp', str(tp)], check=True,
+                           env=env)
             with open(out) as f:
                 results.append(json.load(f))
     base, spec = results
