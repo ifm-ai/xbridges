@@ -145,7 +145,7 @@ def _capture_draft(worker, capture_dir):
 
 
 @torch.no_grad()
-def logits(hf_dir, prompt=PROMPTS[0], dtype='float32', eager=True, tp=1, atol=3e-3):
+def logits(hf_dir, prompt=PROMPTS[0], dtype='float32', eager=True, tp=1, num_speculative_tokens=None, atol=3e-3):
     """Draft vs reference for the first speculative step of `prompt`. Fails above `atol` (max abs diff / max |ref|);
     in float32 the main model's hidden states differ by about 1e-3 as well (vLLM's kernels use TF32)."""
     os.environ['VLLM_ALLOW_INSECURE_SERIALIZATION'] = '1'  # to send _capture_draft to the workers
@@ -153,6 +153,7 @@ def logits(hf_dir, prompt=PROMPTS[0], dtype='float32', eager=True, tp=1, atol=3e
 
     with open(os.path.join(hf_dir, 'config.json')) as f:
         depth = json.load(f)['num_nextn_predict_layers']
+    depth = num_speculative_tokens or depth
     capture_dir = tempfile.mkdtemp()
     llm = _llm(hf_dir, dtype, eager, depth, tensor_parallel_size=tp)
     llm.collective_rpc(_capture_draft, args=(capture_dir,))
@@ -167,9 +168,12 @@ def logits(hf_dir, prompt=PROMPTS[0], dtype='float32', eager=True, tp=1, atol=3e
     print(f'prompt {prompt!r}: {length} tokens, vLLM greedy continuation {output.outputs[0].token_ids} (TP {tp})',
           flush=True)
     calls, first_logits = calls[:depth], draft_logits[:depth]
-    assert [c['step'] for c in calls] == list(range(depth)), [c['step'] for c in calls]
-    for c in calls:
-        assert c['positions'][:length].tolist() == list(range(length)), c['positions']
+    # vLLM runs MTP module k at draft step k (multi-module MTP, e.g. vLLM 0.31), or module 1 at every draft step (e.g.
+    # vLLM 0.24), for the request's last position after the prefill
+    multi_module = [c['step'] for c in calls] == list(range(depth))
+    print(f'vLLM draft steps run modules {[c["step"] + 1 for c in calls]}', flush=True)
+    assert multi_module or all(c['step'] == 0 for c in calls), [c['step'] for c in calls]
+    assert calls[0]['positions'][:length].tolist() == list(range(length)), calls[0]['positions']
     del llm
     gc.collect()
     torch.cuda.empty_cache()
@@ -180,28 +184,42 @@ def logits(hf_dir, prompt=PROMPTS[0], dtype='float32', eager=True, tp=1, atol=3e
           flush=True)
     # the tokens at p + k: the prompt, then the main model's next token, then the drafts
     tokens = torch.cat([ids, torch.tensor(output.outputs[0].token_ids[:1])])
-    worst, ref_hidden = 0., hidden
-    for k, c in enumerate(calls, start=1):
-        if k > 1:
-            tokens = torch.cat([tokens, torch.tensor([first_logits[k - 2][0].argmax().item()])])
-        k_ids = tokens[k:length + k]
-        assert c['ids'][:length].tolist() == k_ids.tolist(), (k, c['ids'], k_ids)
+    worst, ref_hidden, ref_y = 0., hidden, None
+    for step, c in enumerate(calls, start=1):
+        if step > 1:
+            tokens = torch.cat([tokens, torch.tensor([first_logits[step - 2][0].argmax().item()])])
         c = {key: value.cuda() if torch.is_tensor(value) else value for key, value in c.items()}
-        if k == 1:
-            worst = max(worst, _stats('target final-normed hidden states, vLLM vs Transformers', c['hidden'][:length],
-                                      hidden))
+        if multi_module or step == 1:
+            # the prefill of module k = step: at every prompt position p, from the token p + k
+            k, n, k_ids = step, length, tokens[step:length + step]
+            assert c['ids'][:n].tolist() == k_ids.tolist(), (k, c['ids'], k_ids)
+            vllm_hidden = c['hidden'][:n].float()
+            if k == 1:
+                worst = max(worst, _stats('target final-normed hidden states, vLLM vs Transformers', vllm_hidden,
+                                          hidden))
+                prefill_hidden = vllm_hidden
+            what = f'module {k}'
+        else:
+            # module 1 again, at the next position, from the previous draft step's output
+            k, n, k_ids = 1, 1, tokens[1:length + step]
+            assert c['ids'][:1].tolist() == k_ids[-1:].tolist() and c['positions'][0].item() == length + step - 2, c
+            prefill_hidden = torch.cat([prefill_hidden, c['hidden'][:1].float()])
+            vllm_hidden, ref_hidden = prefill_hidden, torch.cat([ref_hidden, ref_y[-1:]])
+            what = f'draft step {step} (module 1, position {length + step - 2})'
         # the draft alone: the reference from the hidden states vLLM gave the module
-        y, _ = ref.module(k, c['hidden'][:length].float(), k_ids)
-        worst = max(worst, _stats(f'module {k} output, from the same input', c['out'][:length], y))
+        y, _ = ref.module(k, vllm_hidden, k_ids)
+        worst = max(worst, _stats(f'{what} output, from the same input', c['out'][:n], y[-n:]))
         # from the Transformers model's hidden states
-        ref_hidden, k_logits = ref.module(k, ref_hidden, k_ids)
-        worst = max(worst, _stats(f'module {k} output (all {length} positions)', c['out'][:length], ref_hidden))
-        rel, _ = _compare_logits(f'module {k} logits (all {length} positions)',
-                                 c['out'][:length].float() @ ref.model.lm_head.weight.T, k_logits)
+        ref_y, k_logits = ref.module(k, ref_hidden, k_ids)
+        if multi_module:
+            ref_hidden = ref_y
+        worst = max(worst, _stats(f'{what} output ({n} positions)', c['out'][:n], ref_y[-n:]))
+        rel, _ = _compare_logits(f'{what} logits ({n} positions)', c['out'][:n].float() @ ref.model.lm_head.weight.T,
+                                 k_logits[-n:])
         worst = max(worst, rel)
-        rel, _ = _compare_logits(f'module {k} drafted logits (last position)', first_logits[k - 1][0], k_logits[-1])
+        rel, _ = _compare_logits(f'{what} drafted logits', first_logits[step - 1][0], k_logits[-1])
         worst = max(worst, rel)
-        print(f'module {k} draft token: vLLM {first_logits[k - 1][0].argmax().item()}, '
+        print(f'{what} draft token: vLLM {first_logits[step - 1][0].argmax().item()}, '
               f'reference {k_logits[-1].argmax().item()}', flush=True)
     print(f'worst max abs diff / max |ref|: {worst:.3e} (atol {atol})', flush=True)
     assert worst < atol
