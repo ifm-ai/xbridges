@@ -1003,6 +1003,14 @@ class K2HorizonForCausalLM(K2HorizonPreTrainedModel, GenerationMixin):
         self.router_aux_loss_coef = config.router_aux_loss_coef
         self.num_experts = config.num_experts
         self.num_experts_per_tok = config.num_experts_per_tok
+        # the checkpoint's multi-token prediction layers (num_nextn_predict_layers, after the decoder layers) are
+        # for speculative decoding and not used here
+        num_mtp_layers = getattr(config, "num_nextn_predict_layers", 0)
+        if num_mtp_layers:
+            self._keys_to_ignore_on_load_unexpected = [
+                rf"^model\.layers\.{layer}\." for layer in
+                range(config.num_hidden_layers, config.num_hidden_layers + num_mtp_layers)
+            ]
 
         # Initialize weights and apply final processing
         self.post_init()
