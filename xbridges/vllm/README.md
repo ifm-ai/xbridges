@@ -17,6 +17,36 @@ MODEL=/abs/path/to/hf_ckpts/my-model sbatch xbridges/vllm/launch_vllm_server.sh
 ```
 * `MODEL` must be an absolute path to the HuggingFace model folder; requests use it as the model name.
 
+## Speculative Decoding with the MTP Layers
+A checkpoint exported with multi-token prediction modules (`num_nextn_predict_layers = D > 0`, see
+`xbridges/huggingface/mtp.py`) can use them as the draft model of vLLM's MTP speculative decoding, as DeepSeek-V3
+does. The draft, `K2HorizonMTPModel` (`k2_horizon/modeling_k2_horizon_mtp_vllm.py`), runs the K2-Horizon decoder
+block of each MTP layer with the main model's embedding and lm_head.
+
+vLLM's own files are not changed: `k2_horizon/mtp_plugin.py` registers the draft when imported (the draft model
+type `k2_horizon_mtp`, its architecture, and a K2-Horizon model that leaves the MTP layers to the draft). Use the
+`vllm` command through `xbridges.vllm.vllm_mtp`, with xBridges on `PYTHONPATH` (the engine and worker processes
+import the plugin from it):
+```shell
+export PYTHONPATH=/abs/path/to/xbridges:$PYTHONPATH
+python -m xbridges.vllm.vllm_mtp serve "${MODEL}" \
+  --trust-remote-code \
+  --speculative-config '{"method": "mtp", "num_speculative_tokens": 2}'
+```
+From Python, import the plugin before creating the engine:
+```python
+import xbridges.vllm.k2_horizon.mtp_plugin  # noqa: F401
+from vllm import LLM
+
+llm = LLM(model=MODEL, trust_remote_code=True,
+          speculative_config={"method": "mtp", "num_speculative_tokens": 2})
+```
+* `num_speculative_tokens` up to D runs MTP modules 1, ..., `num_speculative_tokens`; more reuses them in turn.
+* Without speculative decoding, spawned or Ray workers do not import the plugin: serving such an export then needs
+  a vLLM K2-Horizon model that skips the MTP layers, as `k2_horizon/modeling_k2_horizon_vllm.py` does.
+* Tested with vLLM 0.31.0 on one GPU: `tests/vllm/check_mtp_draft.py` compares the draft with a reference computed
+  with the Transformers model (`logits`) and checks that greedy outputs do not change (`e2e`).
+
 ## Call Vllm Server and Prompt the Model
 ```shell
 MODEL="/abs/path/to/hf_ckpts/my-model"
