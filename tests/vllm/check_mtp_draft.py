@@ -31,8 +31,9 @@ PROMPTS = [
 ]
 
 
-def _llm(hf_dir, dtype, eager, num_speculative_tokens, **kwargs):
-    import xbridges.vllm.k2_horizon.mtp_plugin  # noqa: F401  (registers the draft)
+def _llm(hf_dir, dtype, eager, num_speculative_tokens, plugin=True, **kwargs):
+    if plugin:
+        import xbridges.vllm.k2_horizon.mtp_plugin  # noqa: F401  (registers the draft)
     from vllm import LLM
 
     if num_speculative_tokens:
@@ -208,9 +209,9 @@ def logits(hf_dir, prompt=PROMPTS[0], dtype='float32', eager=True, tp=1, atol=3e
 
 
 def generate(hf_dir, out_json, method='mtp', num_speculative_tokens=0, dtype='float32', eager=False, max_tokens=64,
-             tp=1):
+             tp=1, plugin=True):
     """Greedy generation of PROMPTS, written to out_json with the top-2 logprobs and the speculative decoding
-    counters."""
+    counters. plugin=False: with vLLM's own K2-Horizon model only (it must skip the MTP layers of the export)."""
     from vllm import SamplingParams
 
     kwargs = {'speculative_config': None}
@@ -218,7 +219,7 @@ def generate(hf_dir, out_json, method='mtp', num_speculative_tokens=0, dtype='fl
         kwargs['speculative_config'] = {'method': method, 'num_speculative_tokens': num_speculative_tokens}
         if method == 'ngram':
             kwargs['speculative_config'].update(prompt_lookup_min=1, prompt_lookup_max=3)
-    llm = _llm(hf_dir, dtype, eager, 0, disable_log_stats=False, tensor_parallel_size=tp, **kwargs)
+    llm = _llm(hf_dir, dtype, eager, 0, plugin=plugin, disable_log_stats=False, tensor_parallel_size=tp, **kwargs)
     outputs = llm.generate(PROMPTS, SamplingParams(temperature=0, max_tokens=max_tokens, ignore_eos=True, logprobs=2))
     result = {
         'prompt_tokens': [list(o.prompt_token_ids) for o in outputs],
