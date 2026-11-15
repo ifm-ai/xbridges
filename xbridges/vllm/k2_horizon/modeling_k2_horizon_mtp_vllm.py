@@ -30,6 +30,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.models import k2_horizon
 from vllm.model_executor.models.k2_horizon import (
     K2HorizonDecoderLayer,
     K2HorizonModel,
@@ -251,3 +252,14 @@ class K2HorizonMTP(nn.Module):
             raise ValueError(f"MTP layers {missing} are missing from the checkpoint")
         return loaded_params
 
+
+class K2HorizonForCausalLM(k2_horizon.K2HorizonForCausalLM):
+    """vLLM's K2-Horizon model, which leaves the MTP layers of a checkpoint to the draft. A K2-Horizon model of
+    vLLM that does not skip them (other than xbridges/vllm/k2_horizon/modeling_k2_horizon_vllm.py) fails on them."""
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        return super().load_weights(
+            (name, weight)
+            for name, weight in weights
+            if not is_mtp_layer_weight(self.config, name)
+        )
