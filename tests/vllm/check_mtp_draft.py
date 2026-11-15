@@ -111,9 +111,9 @@ class Reference:
         return y, self.model.lm_head(y)
 
 
-def _capture_draft(capture_dir):
-    """Makes the draft save its inputs and outputs (forward) and its logits to capture_dir while capture_dir/on exists,
-    from the processes that run it (vLLM's workers are forked after this)."""
+def _capture_draft(worker, capture_dir):
+    """Run in vLLM's workers (collective_rpc): makes the draft save its inputs and outputs (forward) and its logits to
+    capture_dir while capture_dir/on exists, from tensor-parallel rank 0."""
     from xbridges.vllm.k2_horizon import modeling_k2_horizon_mtp_vllm as mtp_vllm
 
     forward, compute_logits = mtp_vllm.K2HorizonMultiTokenPredictor.forward, mtp_vllm.K2HorizonMTP.compute_logits
@@ -148,15 +148,14 @@ def _capture_draft(capture_dir):
 def logits(hf_dir, prompt=PROMPTS[0], dtype='float32', eager=True, tp=1, atol=3e-3):
     """Draft vs reference for the first speculative step of `prompt`. Fails above `atol` (max abs diff / max |ref|);
     in float32 the main model's hidden states differ by about 1e-3 as well (vLLM's kernels use TF32)."""
-    os.environ['VLLM_ENABLE_V1_MULTIPROCESSING'] = '0'
-    os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'fork'  # the workers keep the capture below
+    os.environ['VLLM_ALLOW_INSECURE_SERIALIZATION'] = '1'  # to send _capture_draft to the workers
     from vllm import SamplingParams
 
     with open(os.path.join(hf_dir, 'config.json')) as f:
         depth = json.load(f)['num_nextn_predict_layers']
     capture_dir = tempfile.mkdtemp()
-    _capture_draft(capture_dir)
     llm = _llm(hf_dir, dtype, eager, depth, tensor_parallel_size=tp)
+    llm.collective_rpc(_capture_draft, args=(capture_dir,))
     open(os.path.join(capture_dir, 'on'), 'w').close()
     output = llm.generate([prompt], SamplingParams(temperature=0, max_tokens=depth + 1))[0]
     os.remove(os.path.join(capture_dir, 'on'))
