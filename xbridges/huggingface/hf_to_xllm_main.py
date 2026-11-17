@@ -57,6 +57,18 @@ WEIGHT_FILES = (
     ("pytorch_model.bin", "bin"),
 )
 TargetSpec = tuple[tuple[int, ...], torch.dtype]
+SAFETENSORS_DTYPES = {
+    "F64": torch.float64, "F32": torch.float32,
+    "F16": torch.float16, "BF16": torch.bfloat16,
+}
+
+
+def _meta_tensor(view) -> torch.Tensor:
+    """Shape and dtype from the safetensors header, without reading data."""
+    dtype = view.get_dtype()
+    if dtype not in SAFETENSORS_DTYPES:
+        raise TypeError(f"Unsupported safetensors dtype: {dtype}")
+    return torch.empty(view.get_shape(), dtype=SAFETENSORS_DTYPES[dtype], device="meta")
 
 
 def _bool(value: object, name: str) -> bool:
@@ -149,7 +161,9 @@ class HFCheckpointReader:
         return state
 
     @contextmanager
-    def tensors(self, keys: Sequence[str]) -> Iterator[Mapping[str, torch.Tensor]]:
+    def tensors(
+        self, keys: Sequence[str], materialize: bool = True
+    ) -> Iterator[Mapping[str, torch.Tensor]]:
         missing = set(keys) - self.weight_map.keys()
         if missing:
             raise KeyError(f"HF index is missing: {sorted(missing)[:20]}")
@@ -165,7 +179,11 @@ class HFCheckpointReader:
                 if path.suffix == ".safetensors":
                     handle = safe_open(path, framework="pt", device="cpu")
                     opened.append(handle)
-                    selected.update({key: handle.get_tensor(key) for key in file_keys})
+                    if materialize:
+                        selected.update({key: handle.get_tensor(key) for key in file_keys})
+                    else:
+                        selected.update(
+                            {key: _meta_tensor(handle.get_slice(key)) for key in file_keys})
                 else:
                     state = self._load_bin(filename)
                     opened.append(state)
@@ -193,16 +211,28 @@ def _layer_params(config: K2HorizonConfig, layer: int):
     return ATTENTION_PARAMS + MOE_PARAMS
 
 
-def _hf_keys(params, layer: int, config: K2HorizonConfig) -> list[str]:
+def _expert_ids(count: int, split_dim, tp_rank: int, tp_size: int, local_only: bool):
+    """Experts to read. Stacked experts are 3D, so dim 0 / -3 is the expert axis."""
+    if not local_only or split_dim is None or split_dim % 3 != 0:
+        return range(count)
+    if count % tp_size:
+        raise ValueError(f"{count} experts are not divisible by TP={tp_size}")
+    width = count // tp_size
+    return range(tp_rank * width, (tp_rank + 1) * width)
+
+
+def _hf_keys(params, layer: int, config: K2HorizonConfig,
+             tp_rank: int = 0, tp_size: int = 1, local_only: bool = False) -> list[str]:
     keys = []
-    for xllm_key, hf_key, _ in params:
+    for xllm_key, hf_key, split_dim in params:
         count = (
             config.mova_num_experts
             if xllm_key.endswith(".mova.wv.weight")
             else config.num_experts
         )
         if "{expert}" in hf_key:
-            keys.extend(hf_key.format(layer=layer, expert=i) for i in range(count))
+            experts = _expert_ids(count, split_dim, tp_rank, tp_size, local_only)
+            keys.extend(hf_key.format(layer=layer, expert=i) for i in experts)
         else:
             keys.append(hf_key.format(layer=layer))
     return keys
@@ -232,13 +262,13 @@ def _transform(xllm_key: str, weight: torch.Tensor, config: K2HorizonConfig):
     if xllm_key.endswith(".query_norm.weight"):
         return _inverse_permute_qknorm(
             weight, config.num_attention_heads, config.head_dim
-        ).sub(1)
+        ).float().sub(1)
     if xllm_key.endswith(".key_norm.weight"):
         return _inverse_permute_qknorm(
             weight, config.num_key_value_heads, config.head_dim
-        ).sub(1)
+        ).float().sub(1)
     if xllm_key.endswith((".norm.weight", ".final_norm.weight")):
-        return weight.sub(1)
+        return weight.float().sub(1)
     return weight
 
 
@@ -277,8 +307,12 @@ def _convert_params(
             else config.num_experts
         )
         is_expert_weight = "{expert}" in hf_template
+        local_experts = False
         if is_expert_weight:
-            hf_keys = [hf_template.format(**fields, expert=i) for i in range(count)]
+            # Stack only this rank's experts when TP splits the expert axis.
+            experts = _expert_ids(count, split_dim, tp_rank, tp_size, materialize)
+            local_experts = len(experts) != count
+            hf_keys = [hf_template.format(**fields, expert=i) for i in experts]
             tensors = [source[key] for key in hf_keys]
             weight = torch.stack(tensors) if materialize else None
             shape = (count, *expected[hf_keys[0]].shape)
@@ -308,7 +342,8 @@ def _convert_params(
 
         if materialize:
             weight = _transform(xllm_key, weight, config)
-            weight = _slice(weight, tp_rank, tp_size, split_dim)
+            if not local_experts:
+                weight = _slice(weight, tp_rank, tp_size, split_dim)
             if is_expert_weight and expert_weight_format == "2d":
                 weight = weight.flatten(0, 1)
             if weight.dtype != target_dtype:
@@ -336,7 +371,8 @@ def build_tp_state_dict(
             for param in _layer_params(config, layer)
             if param[1].format(layer=layer, expert=0) in expected
         ]
-        with reader.tensors(_hf_keys(params, layer, config)) as source:
+        keys = _hf_keys(params, layer, config, tp_rank, tp_size, materialize)
+        with reader.tensors(keys, materialize) as source:
             converted, converted_specs = _convert_params(
                 source, expected, params, layer, config, tp_rank, tp_size,
                 materialize, target_dtype, norm_key_format, expert_weight_format,
@@ -347,7 +383,7 @@ def build_tp_state_dict(
                     config.num_hidden_layers, " materialized" if materialize else " validated")
 
     keys = [hf for _, hf, _ in OTHER_PARAMS]
-    with reader.tensors(keys) as source:
+    with reader.tensors(keys, materialize) as source:
         converted, converted_specs = _convert_params(
             source, expected, OTHER_PARAMS, None, config, tp_rank, tp_size,
             materialize, target_dtype, norm_key_format, expert_weight_format,
@@ -577,6 +613,7 @@ def _rank_worker(kwargs):
     log_path = Path(kwargs.pop("log_path"))
     threads = str(kwargs.pop("threads_per_rank"))
     os.environ.update(OMP_NUM_THREADS=threads, MKL_NUM_THREADS=threads, MALLOC_ARENA_MAX="4")
+    torch.set_num_threads(int(threads))  # env vars are too late in a forked worker
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s",
                         handlers=[logging.FileHandler(log_path), logging.StreamHandler()], force=True)
     convert_checkpoint(tp_rank=rank, **kwargs)
@@ -628,6 +665,8 @@ def main(
     concurrent_ranks: int | None = None,
     norm_key_format: str = "new",
     expert_weight_format: str = "2d",
+    dry_run: bool = False,
+    skip_existing: bool = False,
 ) -> None:
     """Convert HF weights, optionally batching ranks in parallel.
 
@@ -639,6 +678,8 @@ def main(
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
     if writer_threads < 1:
         raise ValueError("writer_threads must be positive")
+    dry_run = _bool(dry_run, "dry_run")
+    skip_existing = _bool(skip_existing, "skip_existing")
     reader = HFCheckpointReader(Path(hf_dir))
     _validate_hf(reader, strict_keys=True)
     tp_size = _tp_size(reader.config, tp_size)
@@ -652,11 +693,15 @@ def main(
     output = Path(save_dir)
     existing = [output / f"full_model.tp{rank:02d}" for rank in ranks
                 if (output / f"full_model.tp{rank:02d}").exists()]
-    if existing:
+    if existing and not skip_existing:
         raise FileExistsError(
             "Refusing to overwrite existing checkpoint(s): "
             + ", ".join(map(str, existing))
         )
+    if existing:
+        # A full_model.tpNN directory only appears after a validated, atomic rename.
+        logger.info("Skipping completed checkpoint(s): %s", ", ".join(map(str, existing)))
+        ranks = [rank for rank in ranks if output / f"full_model.tp{rank:02d}" not in existing]
 
     common = dict(hf_dir=hf_dir, save_dir=save_dir, tp_size=tp_size,
                   strict_keys=True, writer_threads=writer_threads, sync_files=True,
@@ -671,6 +716,12 @@ def main(
         math.prod(shape) * torch.empty((), dtype=spec_dtype).element_size()
         for shape, spec_dtype in planned_specs.values()
     )
+    if dry_run:
+        logger.info("Dry run passed: %.2f GiB per TP rank", rank_bytes / 2**30)
+        return
+    if not ranks:
+        logger.info("All selected TP ranks already exist")
+        return
     active = _memory_limited_concurrency(
         min(concurrent_ranks, len(ranks)), rank_bytes)
     output.mkdir(parents=True, exist_ok=True)
