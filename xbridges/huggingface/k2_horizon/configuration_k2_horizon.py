@@ -84,6 +84,9 @@ class K2HorizonConfig(PreTrainedConfig):
     attention_gate_func: str | None = None
     mova_num_experts: int = 0
     mova_num_experts_per_tok: int = 0
+    # Multi-token prediction modules (xLLM model.mtp_depth), stored as DeepSeek-V3 stores its MTP layers: as layers
+    # num_hidden_layers, ..., num_hidden_layers + num_nextn_predict_layers - 1. The model itself does not use them.
+    num_nextn_predict_layers: int = 0
     # Set by the XLLM bridge so a reverse conversion can reproduce the source
     # tensor-parallel layout. Generic HuggingFace checkpoints leave this unset.
     xllm_model_parallel_size: int | None = None

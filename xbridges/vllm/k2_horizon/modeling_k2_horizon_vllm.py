@@ -1425,8 +1425,22 @@ class K2HorizonForCausalLM(
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # The multi-token prediction layers of the checkpoint (num_nextn_predict_layers
+        # after the decoder layers) are for the speculative decoding draft.
+        num_layers = self.config.num_hidden_layers
+        mtp_prefixes = tuple(
+            f"model.layers.{layer}."
+            for layer in range(
+                num_layers,
+                num_layers + getattr(self.config, "num_nextn_predict_layers", 0),
+            )
+        )
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+        return loader.load_weights(
+            (name, weight)
+            for name, weight in weights
+            if not name.startswith(mtp_prefixes)
+        )
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()

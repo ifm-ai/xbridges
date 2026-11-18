@@ -255,6 +255,10 @@ def _build_hf_model(*, xllm_dir: Path, tokenizer_dir: Path) -> tuple[Any, Any, A
         xllm_config=json.loads((xllm_dir / "config.json").read_text()),
         tokenizer=tokenizer,
     )
+    if hf_config.num_nextn_predict_layers:
+        raise NotImplementedError(
+            "Checkpoints with multi-token prediction modules (xLLM model.mtp_depth > 0): use xllm_to_hf_main.py"
+        )
     with torch.device("meta"):
         model = K2HorizonForCausalLM(config=hf_config)
     return tokenizer, hf_config, model

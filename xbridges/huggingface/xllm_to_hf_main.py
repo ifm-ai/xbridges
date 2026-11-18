@@ -13,6 +13,7 @@ from transformers import AutoTokenizer
 
 from xbridges.huggingface.k2_horizon.configuration_k2_horizon import K2HorizonConfig
 from xbridges.huggingface.k2_horizon.modeling_k2_horizon import K2HorizonForCausalLM
+from xbridges.huggingface.mtp import convert_mtp_state_dict_xllm_to_hf, merge_mtp_state_dicts, pop_mtp_state_dict
 
 
 ATTENTION_PARAMS = [
@@ -152,6 +153,7 @@ def convert_config_xllm_to_hf(xllm_config, tokenizer):
         },
         vocab_size=xllm_config['model']['vocab_size'],
         num_hidden_layers=xllm_config['model']['num_layers'],
+        num_nextn_predict_layers=xllm_config['model'].get('mtp_depth', 0),
         mlp_only_layers=mlp_only_layers,
         hidden_size=xllm_config['model']['model_dim'],
         num_attention_heads=xllm_config['model']['num_heads'],
@@ -347,7 +349,8 @@ def merge_state_dicts(state_dict, tp_state_dict, num_layers, hf_config):
             state_dict[xllm_key] = torch.cat(
                 [state_dict[xllm_key], tp_state_dict[xllm_key]], dim=split_dim)
 
-    return state_dict
+    # multi-token prediction modules (xbridges/huggingface/mtp.py)
+    return merge_mtp_state_dicts(state_dict, tp_state_dict, hf_config)
 
 
 def load_xllm_state_dict(xllm_dir, hf_config, layer_l, layer_r):
@@ -457,6 +460,7 @@ def main(xllm_dir='ckpts/xllm-30b-a3b',
 
     weight_map = {}
     total_size = 0
+    mtp_keys = set()
     for load_idx in tqdm.trange(n_load_times, desc='Saving'):
         layer_l = layers_per_load * load_idx
         layer_r = min(layers_per_load * (load_idx + 1), hf_config.num_hidden_layers)
@@ -467,6 +471,8 @@ def main(xllm_dir='ckpts/xllm-30b-a3b',
             layer_r=layer_r)
 
         print(f'Converting XLLM state_dict to HF format...')
+        # the multi-token prediction modules are converted and saved on their own (xbridges/huggingface/mtp.py)
+        mtp_state_dict = pop_mtp_state_dict(xllm_state_dict)
         state_dict = convert_state_dict_xllm_to_hf(
             hf_state_dict=hf_model.state_dict(),
             hf_config=hf_model.config,
@@ -506,7 +512,22 @@ def main(xllm_dir='ckpts/xllm-30b-a3b',
         del state_dict
         gc.collect()
 
-    if weight_map.keys() != hf_model.state_dict().keys():
+        if mtp_state_dict:
+            mtp_sd = convert_mtp_state_dict_xllm_to_hf(hf_model.state_dict(), hf_model.config, mtp_state_dict)
+            mtp_sd = {key: value.to(output_dtype).contiguous() for key, value in mtp_sd.items()}
+            total_size += sum(value.numel() * value.element_size() for value in mtp_sd.values())
+            filename = 'model-mtp.safetensors' if safe_serialization else 'pytorch_model-mtp.bin'
+            if safe_serialization:
+                save_file(mtp_sd, f'{save_dir}/{filename}', metadata={'format': 'pt'})
+            else:
+                torch.save(mtp_sd, f'{save_dir}/{filename}')
+            weight_map.update({key: filename for key in mtp_sd})
+            mtp_keys.update(mtp_sd)
+            print(f'{save_dir}/{filename} written ({hf_config.num_nextn_predict_layers} MTP layers).')
+            del mtp_sd, mtp_state_dict
+            gc.collect()
+
+    if weight_map.keys() != hf_model.state_dict().keys() | mtp_keys:
         raise ValueError('Exported index does not cover the complete HF model')
     index_name = 'model.safetensors.index.json' if safe_serialization else 'pytorch_model.bin.index.json'
     json.dump({
