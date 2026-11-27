@@ -175,8 +175,8 @@ def convert_config_xllm_to_hf(xllm_config, tokenizer):
         layernorm_num_groups=xllm_config['model']['layernorm_num_groups'],
         num_shared_experts=xllm_config['model']['num_shared_experts'],
         router_score_func=xllm_config['model']['moe_router_score_func'],
-        router_aux_loss_coef=xllm_config.get('moe_aux_loss_coeff',
-                                             K2HorizonConfig.router_aux_loss_coef),
+        # xLLM's default: a run without moe_aux_loss_coeff trained without the aux loss
+        router_aux_loss_coef=xllm_config.get('moe_aux_loss_coeff', 0.0),
         router_scaling_factor=xllm_config['model']['moe_router_scaling_factor'],
         rope_head_dim=xllm_config['model']['rope_head_dim'],
         attention_gate_func=attention_gate_func,
