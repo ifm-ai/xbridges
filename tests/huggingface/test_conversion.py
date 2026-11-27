@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -133,6 +134,47 @@ def test_rms_norm_epsilon_follows_checkpoint_config(kind, eps_fields):
     cfg = bridge.convert_config_xllm_to_hf(
         config, SimpleNamespace(pad_token_id=31, bos_token_id=0, eos_token_id=1))
     assert cfg.rms_norm_eps == 3e-5
+
+
+def hf_config(kind, **overrides):
+    sparse = kind != 'dense'
+    fields = dict(
+        vocab_size=32, hidden_size=8, intermediate_size=16, num_hidden_layers=2, num_attention_heads=4,
+        num_key_value_heads=2, head_dim=4, rope_head_dim=2, layernorm_num_groups=2, max_position_embeddings=32,
+        rope_parameters={'rope_theta': 10000, 'rope_type': 'default'}, rms_norm_eps=3e-5,
+        num_experts=4 if sparse else 0, num_experts_per_tok=2 if sparse else 0, moe_intermediate_size=6,
+        num_shared_experts=1 if sparse else 0, mlp_only_layers=[0] if sparse else [], moe_gate_bias=sparse,
+        router_score_func='sigmoid', router_scaling_factor=2.5,
+        mova_num_experts=4 if kind == 'mova' else 0, mova_num_experts_per_tok=2 if kind == 'mova' else 0,
+        attention_gate_func='softplus' if sparse else None,
+    )
+    fields.update(overrides)
+    return bridge.K2HorizonConfig(**fields)
+
+
+@pytest.mark.parametrize('kind', ['dense', 'moe', 'mova'])
+def test_hf_to_xllm_config_loads_in_xllm(kind):
+    xllm_config = pytest.importorskip('xllm.config')
+    model = reverse_bridge._xllm_config(hf_config(kind), Path('/hf'), 1, 'bf16', 1e-3)['model']
+
+    # ModelConf only warns about a field it does not have and keeps its own default
+    assert set(model) <= set(xllm_config.ModelConf.__dataclass_fields__)
+    cfg = xllm_config.ModelConf.from_dict(model)
+    assert cfg.rmsnorm_eps == 3e-5
+    assert cfg.apply_attn_gate is (kind != 'dense')
+    assert cfg.attn_gate_func == 'softplus'
+
+
+@pytest.mark.parametrize('kind', ['dense', 'moe', 'mova'])
+def test_hf_to_xllm_config_round_trip(kind):
+    source = hf_config(kind)
+    xllm = reverse_bridge._xllm_config(source, Path('/hf'), 1, 'bf16', 1e-3)
+    assert xllm['model']['rmsnorm_eps'] == 3e-5 and 'norm_eps' not in xllm['model']
+    assert ('attn_gate_func' in xllm['model']) is (kind != 'dense')
+
+    cfg = bridge.convert_config_xllm_to_hf(xllm, SimpleNamespace(pad_token_id=31, bos_token_id=0, eos_token_id=1))
+    assert cfg.rms_norm_eps == source.rms_norm_eps
+    assert cfg.attention_gate_func == source.attention_gate_func
 
 
 @pytest.mark.parametrize('field,value', [

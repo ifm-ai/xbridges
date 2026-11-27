@@ -455,6 +455,8 @@ def _xllm_config(config: K2HorizonConfig, hf_dir: Path, tp_size: int,
         raise ValueError("HF config must define rope_parameters")
     rope_theta = rope["rope_theta"] if isinstance(rope, dict) else rope.rope_theta
     dense = len(config.mlp_only_layers) if config.num_experts else None
+    # xLLM's ModelConf only accepts a gate function name, so the field is left out without a gate
+    attn_gate = {} if config.attention_gate_func is None else {"attn_gate_func": config.attention_gate_func}
     return {
         "model_parallel_size": tp_size,
         "context_parallel_size": 1,
@@ -478,13 +480,13 @@ def _xllm_config(config: K2HorizonConfig, hf_dir: Path, tp_size: int,
             "moe_router_scaling_factor": config.router_scaling_factor,
             "vocab_size": config.vocab_size,
             "layernorm_num_groups": config.layernorm_num_groups,
-            "norm_eps": config.rms_norm_eps, "apply_rmsnorm": True,
+            "rmsnorm_eps": config.rms_norm_eps, "apply_rmsnorm": True,
             "rope_base": rope_theta, "rope_head_dim": config.rope_head_dim,
             "attention_dropout": config.attention_dropout, "swiglu": True,
             "num_values": config.mova_num_experts,
             "num_activated_values": config.mova_num_experts_per_tok,
             "apply_attn_gate": config.attention_gate_func is not None,
-            "attn_gate_func": config.attention_gate_func,
+            **attn_gate,
             "init_std": config.initializer_range,
             "fused_block": False, "init_mode": "none",
         },
